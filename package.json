@@ -1,0 +1,36 @@
+{
+  "name": "@moltrust/verify",
+  "version": "1.0.0",
+  "description": "Offline W3C VC verification against Base L2 — no MolTrust API required",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test dist/verify.test.js",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "viem": "^2.47.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.15",
+    "typescript": "^5.9.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MoltyCel/moltrust-verify"
+  },
+  "license": "MIT",
+  "keywords": [
+    "moltrust",
+    "verify",
+    "offline",
+    "base-l2",
+    "verifiable-credentials",
+    "w3c-did",
+    "erc-8004"
+  ]
+}
