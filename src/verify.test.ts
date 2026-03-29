@@ -15,6 +15,10 @@ const ERC8004_AGENT_ID = 33553;
 // TrustScout DID anchor TX
 const TRUSTSCOUT_DID_TX = '0x75ea4e77071cb4efb77a9e97a0d7ee49d9914cd01477a37a299fa6bc749c275a' as const;
 
+// TrustScout DID key anchor TX (contains public key in calldata)
+const TRUSTSCOUT_KEY_TX = '0xde579d2cdd54a42bb61966ff3eecd9e130af9eac643650a3784b0736acf63d4c' as const;
+const TRUSTSCOUT_PUBKEY = '7559b2514a46703465ea558b581ce8dd33121c3b0050a4414769b66a957fa892';
+
 function makeVC(overrides: Partial<VerifiableCredential> = {}): VerifiableCredential {
   const now = new Date();
   const expires = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
@@ -125,5 +129,68 @@ describe('MolTrustVerifier — on-chain verification', () => {
   test('resolveERC8004 for non-existent agent returns exists=false', async () => {
     const agent = await verifier.resolveERC8004(999999999);
     assert.strictEqual(agent.exists, false);
+  });
+});
+
+describe('MolTrustVerifier — v1.1.0: public key resolution', () => {
+  test('resolvePublicKey from TrustScout DID key anchor TX', async () => {
+    const key = await verifier.resolvePublicKey(
+      'did:moltrust:d34ed796a4dc4698',
+      TRUSTSCOUT_KEY_TX,
+    );
+    assert.strictEqual(key, TRUSTSCOUT_PUBKEY);
+    assert.strictEqual(key?.length, 64);
+    console.log(`  Resolved public key: ${key}`);
+  });
+
+  test('resolvePublicKey returns null for wrong DID', async () => {
+    const key = await verifier.resolvePublicKey(
+      'did:moltrust:wrong_identifier',
+      TRUSTSCOUT_KEY_TX,
+    );
+    assert.strictEqual(key, null);
+  });
+
+  test('resolvePublicKey returns null for non-existent TX', async () => {
+    const key = await verifier.resolvePublicKey(
+      'did:moltrust:d34ed796a4dc4698',
+      '0x' + 'dead'.repeat(16) as `0x${string}`,
+    );
+    assert.strictEqual(key, null);
+  });
+});
+
+describe('MolTrustVerifier — v1.1.0: IPR output verification', () => {
+  test('verifyOutput rejects invalid merkle proof', async () => {
+    const result = await verifier.verifyOutput({
+      agentDid: 'did:moltrust:d34ed796a4dc4698',
+      outputHash: 'sha256:' + 'aa'.repeat(32),
+      merkleProof: {
+        root: '0x' + 'dead'.repeat(16),
+        leaf: '0x' + 'beef'.repeat(16),
+        proof: [],
+        leaf_index: 0,
+        anchorTx: '0x' + 'dead'.repeat(16) as `0x${string}`,
+      },
+    });
+    assert.strictEqual(result.verified, false);
+    assert.ok(result.reason?.includes('Merkle proof invalid') || result.reason?.includes('not found'));
+  });
+
+  test('verifyOutput returns correct result shape', async () => {
+    const result = await verifier.verifyOutput({
+      agentDid: 'did:moltrust:test',
+      outputHash: 'sha256:' + 'cc'.repeat(32),
+      merkleProof: {
+        root: '0x' + 'ab'.repeat(32),
+        leaf: '0x' + 'ab'.repeat(32),  // leaf == root (single leaf tree)
+        proof: [],
+        leaf_index: 0,
+        anchorTx: TRUSTSCOUT_DID_TX,  // exists on chain but won't match root
+      },
+    });
+    assert.strictEqual(typeof result.verified, 'boolean');
+    assert.strictEqual(typeof result.checkedAt, 'string');
+    assert.ok(result.method === 'merkle-onchain' || result.method === 'not-found');
   });
 });

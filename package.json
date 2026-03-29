@@ -1,7 +1,7 @@
 {
   "name": "@moltrust/verify",
-  "version": "1.0.0",
-  "description": "Offline W3C VC verification against Base L2 — no MolTrust API required",
+  "version": "1.1.0",
+  "description": "Offline W3C VC + IPR verification against Base L2 — no MolTrust API required",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [

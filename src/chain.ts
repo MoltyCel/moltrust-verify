@@ -103,6 +103,37 @@ export async function verifyDIDAnchor(
 }
 
 /**
+ * Resolve an agent's Ed25519 public key from a Base L2 DID anchor TX.
+ * Calldata format: "MolTrust/DID/v1/<identifier>/<publicKeyHex>"
+ */
+export async function resolvePublicKeyFromChain(
+  client: any,
+  did: string,
+  anchorTx: `0x${string}`,
+): Promise<string | null> {
+  const identifier = did.split(':').pop();
+  if (!identifier) return null;
+
+  try {
+    const tx = await client.getTransaction({ hash: anchorTx });
+    const calldata = Buffer.from(
+      (tx.input as string).slice(2),
+      'hex',
+    ).toString('utf8');
+
+    const prefix = `MolTrust/DID/v1/${identifier}/`;
+    if (!calldata.startsWith(prefix)) return null;
+
+    const pubKeyHex = calldata.slice(prefix.length).trim();
+    if (pubKeyHex.length !== 64) return null; // 32 bytes = 64 hex chars
+
+    return pubKeyHex;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Verify a skill VC anchor. Calldata format: "MolTrust/SkillVC/1 SHA256:<hash>"
  */
 export async function verifySkillAnchor(

@@ -1,7 +1,7 @@
-import { createHash } from 'node:crypto';
+import { createHash, verify as cryptoVerify, createPublicKey } from 'node:crypto';
 
 import type { VerifiableCredential, VerificationResult } from './types.js';
-import { verifyTxCalldata, verifyDIDAnchor, resolveERC8004Agent } from './chain.js';
+import { verifyTxCalldata, verifyDIDAnchor, resolveERC8004Agent, resolvePublicKeyFromChain } from './chain.js';
 
 /** Check if a VC has expired */
 export function checkExpiry(vc: VerifiableCredential): boolean {
@@ -24,6 +24,92 @@ export function computeVCHash(vc: VerifiableCredential): string {
 /** Extract DID from credential subject */
 export function extractDID(vc: VerifiableCredential): string {
   return vc.credentialSubject.id || '';
+}
+
+/**
+ * Verify a VC's Ed25519 signature using a public key resolved from Base L2.
+ * This is the full offline verification path — no MolTrust API needed.
+ */
+export async function verifyCredentialWithKey(
+  vc: VerifiableCredential,
+  anchorTx: `0x${string}`,
+  client: any,
+): Promise<VerificationResult> {
+  const did = extractDID(vc);
+  const limitations: string[] = [];
+
+  // 1. Expiry check
+  const notExpired = checkExpiry(vc) && checkIssuanceDate(vc);
+
+  // 2. JWS presence
+  const jwsPresent = !!(vc.proof?.jws && vc.proof.jws.length > 0);
+
+  // 3. Resolve public key from chain
+  const pubKeyHex = await resolvePublicKeyFromChain(client, did, anchorTx);
+
+  if (!pubKeyHex) {
+    limitations.push('Public key not resolvable from provided anchor TX');
+    return {
+      valid: notExpired,
+      did,
+      method: 'partial-onchain',
+      checks: {
+        notExpired,
+        hashAnchored: null,
+        erc8004Exists: null,
+        jwsPresent,
+        signatureVerified: null,
+      },
+      limitations,
+      checkedAt: new Date().toISOString(),
+    };
+  }
+
+  // 4. Verify Ed25519 signature
+  let signatureVerified: boolean | null = null;
+  if (jwsPresent && vc.proof?.jws) {
+    try {
+      const jws = vc.proof.jws;
+      const parts = jws.split('.');
+      if (parts.length === 3) {
+        const signingInput = `${parts[0]}.${parts[1]}`;
+        const signature = Buffer.from(parts[2], 'base64url');
+        const pubKeyBytes = Buffer.from(pubKeyHex, 'hex');
+
+        // Build Ed25519 public key in DER format for Node crypto
+        // Ed25519 public key DER prefix: 302a300506032b6570032100
+        const derPrefix = Buffer.from('302a300506032b6570032100', 'hex');
+        const derKey = Buffer.concat([derPrefix, pubKeyBytes]);
+        const publicKey = createPublicKey({ key: derKey, format: 'der', type: 'spki' });
+
+        signatureVerified = cryptoVerify(
+          null,
+          Buffer.from(signingInput),
+          publicKey,
+          signature,
+        );
+      }
+    } catch {
+      signatureVerified = false;
+    }
+  }
+
+  const valid = notExpired && (signatureVerified === true);
+
+  return {
+    valid,
+    did,
+    method: 'onchain',
+    checks: {
+      notExpired,
+      hashAnchored: null,
+      erc8004Exists: null,
+      jwsPresent,
+      signatureVerified,
+    },
+    limitations,
+    checkedAt: new Date().toISOString(),
+  };
 }
 
 /** Extract ERC-8004 agent ID from DID if present */
