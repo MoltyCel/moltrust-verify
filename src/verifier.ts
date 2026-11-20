@@ -1,4 +1,6 @@
-import { createHash, verify as cryptoVerify, createPublicKey } from 'node:crypto';
+import {
+  createHash, verify as cryptoVerify, createPublicKey, ECDH, type KeyObject,
+} from 'node:crypto';
 
 import type { VerifiableCredential, VerificationResult } from './types.js';
 import { verifyTxCalldata, verifyDIDAnchor, resolveERC8004Agent, resolvePublicKeyFromChain } from './chain.js';
@@ -26,8 +28,88 @@ export function extractDID(vc: VerifiableCredential): string {
   return vc.credentialSubject.id || '';
 }
 
+// SPKI DER prefixes. Appending the raw public key yields a key node:crypto
+// can import.
+// Ed25519: 32-byte key.
+const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
+// P-256 (prime256v1): 65-byte uncompressed SEC1 point (0x04 || X || Y).
+const P256_SPKI_PREFIX = Buffer.from(
+  '3059301306072a8648ce3d020106082a8648ce3d030107034200',
+  'hex',
+);
+
+/** Build an Ed25519 public key from 32 raw bytes given as 64 hex chars. */
+function ed25519KeyFromHex(pubKeyHex: string): KeyObject | null {
+  if (!/^[0-9a-fA-F]{64}$/.test(pubKeyHex)) return null;
+  const derKey = Buffer.concat([ED25519_SPKI_PREFIX, Buffer.from(pubKeyHex, 'hex')]);
+  return createPublicKey({ key: derKey, format: 'der', type: 'spki' });
+}
+
 /**
- * Verify a VC's Ed25519 signature using a public key resolved from Base L2.
+ * Build a P-256 public key from a SEC1 point given as hex: 33 bytes
+ * compressed (66 hex chars) or 65 bytes uncompressed (130 hex chars).
+ */
+function p256KeyFromHex(pubKeyHex: string): KeyObject | null {
+  let uncompressedHex: string;
+  if (/^0[23][0-9a-fA-F]{64}$/.test(pubKeyHex)) {
+    uncompressedHex = ECDH.convertKey(
+      pubKeyHex, 'prime256v1', 'hex', 'hex', 'uncompressed',
+    ) as string;
+  } else if (/^04[0-9a-fA-F]{128}$/.test(pubKeyHex)) {
+    uncompressedHex = pubKeyHex;
+  } else {
+    return null;
+  }
+  const derKey = Buffer.concat([P256_SPKI_PREFIX, Buffer.from(uncompressedHex, 'hex')]);
+  return createPublicKey({ key: derKey, format: 'der', type: 'spki' });
+}
+
+/**
+ * Verify a compact JWS against a hex-encoded public key.
+ *
+ * The algorithm comes from the JWS protected header:
+ * - `EdDSA` (or its RFC 9864 alias `Ed25519`): Ed25519, 32-byte key.
+ * - `ES256`: ECDSA P-256 with SHA-256. The key is a SEC1 point (compressed
+ *   or uncompressed); the signature must be the raw 64-byte r||s pair
+ *   (RFC 7518 §3.4), not DER.
+ *
+ * Any other or missing `alg`, or a key that does not fit the algorithm,
+ * fails. There is no fallback to another algorithm.
+ */
+export function verifyJwsWithPublicKey(jws: string, pubKeyHex: string): boolean {
+  try {
+    const parts = jws.split('.');
+    if (parts.length !== 3) return false;
+    const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+    if (header === null || typeof header !== 'object') return false;
+    const alg = header.alg;
+    const signingInput = Buffer.from(`${parts[0]}.${parts[1]}`);
+    const signature = Buffer.from(parts[2], 'base64url');
+
+    if (alg === 'EdDSA' || alg === 'Ed25519') {
+      const publicKey = ed25519KeyFromHex(pubKeyHex);
+      if (!publicKey) return false;
+      return cryptoVerify(null, signingInput, publicKey, signature);
+    }
+    if (alg === 'ES256') {
+      const publicKey = p256KeyFromHex(pubKeyHex);
+      if (!publicKey) return false;
+      if (signature.length !== 64) return false;
+      return cryptoVerify(
+        'sha256',
+        signingInput,
+        { key: publicKey, dsaEncoding: 'ieee-p1363' },
+        signature,
+      );
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Verify a VC's JWS signature (EdDSA or ES256) using a public key resolved from Base L2.
  * This is the full offline verification path — no MolTrust API needed.
  */
 export async function verifyCredentialWithKey(
@@ -65,33 +147,10 @@ export async function verifyCredentialWithKey(
     };
   }
 
-  // 4. Verify Ed25519 signature
+  // 4. Verify the JWS signature (EdDSA or ES256, chosen by the protected header)
   let signatureVerified: boolean | null = null;
   if (jwsPresent && vc.proof?.jws) {
-    try {
-      const jws = vc.proof.jws;
-      const parts = jws.split('.');
-      if (parts.length === 3) {
-        const signingInput = `${parts[0]}.${parts[1]}`;
-        const signature = Buffer.from(parts[2], 'base64url');
-        const pubKeyBytes = Buffer.from(pubKeyHex, 'hex');
-
-        // Build Ed25519 public key in DER format for Node crypto
-        // Ed25519 public key DER prefix: 302a300506032b6570032100
-        const derPrefix = Buffer.from('302a300506032b6570032100', 'hex');
-        const derKey = Buffer.concat([derPrefix, pubKeyBytes]);
-        const publicKey = createPublicKey({ key: derKey, format: 'der', type: 'spki' });
-
-        signatureVerified = cryptoVerify(
-          null,
-          Buffer.from(signingInput),
-          publicKey,
-          signature,
-        );
-      }
-    } catch {
-      signatureVerified = false;
-    }
+    signatureVerified = verifyJwsWithPublicKey(vc.proof.jws, pubKeyHex);
   }
 
   const valid = notExpired && (signatureVerified === true);

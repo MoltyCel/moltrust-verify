@@ -1,6 +1,8 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert';
+import { generateKeyPairSync, sign as cryptoSign, type KeyObject } from 'node:crypto';
 import { MolTrustVerifier } from './index.js';
+import { verifyCredentialWithKey, verifyJwsWithPublicKey } from './verifier.js';
 import type { VerifiableCredential } from './types.js';
 
 const verifier = new MolTrustVerifier({ rpcUrl: 'https://mainnet.base.org' });
@@ -192,5 +194,123 @@ describe('MolTrustVerifier — v1.1.0: IPR output verification', () => {
     assert.strictEqual(typeof result.verified, 'boolean');
     assert.strictEqual(typeof result.checkedAt, 'string');
     assert.ok(result.method === 'merkle-onchain' || result.method === 'not-found');
+  });
+});
+
+// --------------------------------------------------------------------------
+// JWS algorithm selection (EdDSA / ES256). Offline: keys are generated here.
+// --------------------------------------------------------------------------
+
+const b64url = (v: Buffer | string) => Buffer.from(v).toString('base64url');
+
+function compactJws(
+  header: Record<string, unknown>,
+  payload: Record<string, unknown>,
+  signer: (input: Buffer) => Buffer,
+): string {
+  const h = b64url(JSON.stringify(header));
+  const p = b64url(JSON.stringify(payload));
+  return `${h}.${p}.${b64url(signer(Buffer.from(`${h}.${p}`)))}`;
+}
+
+const PAYLOAD = { sub: 'did:moltrust:d34ed796a4dc4698', trustScore: 85 };
+
+const ed = generateKeyPairSync('ed25519');
+const edPubHex = Buffer.from(
+  (ed.publicKey.export({ format: 'jwk' }) as { x: string }).x, 'base64url',
+).toString('hex');
+const edSign = (input: Buffer) => cryptoSign(null, input, ed.privateKey);
+
+const p256 = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+function p256Hex(key: KeyObject, compressed: boolean): string {
+  const jwk = key.export({ format: 'jwk' }) as { x: string; y: string };
+  const x = Buffer.from(jwk.x, 'base64url');
+  const y = Buffer.from(jwk.y, 'base64url');
+  if (!compressed) return Buffer.concat([Buffer.from([0x04]), x, y]).toString('hex');
+  const prefix = (y[y.length - 1] & 1) === 0 ? 0x02 : 0x03;
+  return Buffer.concat([Buffer.from([prefix]), x]).toString('hex');
+}
+const p256Uncompressed = p256Hex(p256.publicKey, false);
+const p256Compressed = p256Hex(p256.publicKey, true);
+const es256Sign = (input: Buffer) =>
+  cryptoSign('sha256', input, { key: p256.privateKey, dsaEncoding: 'ieee-p1363' });
+const es256SignDer = (input: Buffer) =>
+  cryptoSign('sha256', input, { key: p256.privateKey, dsaEncoding: 'der' });
+
+describe('JWS algorithm selection (EdDSA / ES256)', () => {
+  test('EdDSA still verifies', () => {
+    const jws = compactJws({ alg: 'EdDSA' }, PAYLOAD, edSign);
+    assert.strictEqual(verifyJwsWithPublicKey(jws, edPubHex), true);
+  });
+
+  test('RFC 9864 alg "Ed25519" is accepted as an alias for EdDSA', () => {
+    const jws = compactJws({ alg: 'Ed25519' }, PAYLOAD, edSign);
+    assert.strictEqual(verifyJwsWithPublicKey(jws, edPubHex), true);
+  });
+
+  test('EdDSA over a tampered payload fails', () => {
+    const jws = compactJws({ alg: 'EdDSA' }, PAYLOAD, edSign);
+    const [h, , sig] = jws.split('.');
+    const forged = `${h}.${b64url(JSON.stringify({ ...PAYLOAD, trustScore: 99 }))}.${sig}`;
+    assert.strictEqual(verifyJwsWithPublicKey(forged, edPubHex), false);
+  });
+
+  test('ES256 verifies with an uncompressed P-256 key (130 hex)', () => {
+    assert.strictEqual(p256Uncompressed.length, 130);
+    const jws = compactJws({ alg: 'ES256' }, PAYLOAD, es256Sign);
+    assert.strictEqual(verifyJwsWithPublicKey(jws, p256Uncompressed), true);
+  });
+
+  test('ES256 verifies with a compressed P-256 key (66 hex)', () => {
+    assert.strictEqual(p256Compressed.length, 66);
+    const jws = compactJws({ alg: 'ES256' }, PAYLOAD, es256Sign);
+    assert.strictEqual(verifyJwsWithPublicKey(jws, p256Compressed), true);
+  });
+
+  test('ES256 signed by a different P-256 key fails', () => {
+    const other = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    const jws = compactJws({ alg: 'ES256' }, PAYLOAD, (input) =>
+      cryptoSign('sha256', input, { key: other.privateKey, dsaEncoding: 'ieee-p1363' }));
+    assert.strictEqual(verifyJwsWithPublicKey(jws, p256Uncompressed), false);
+  });
+
+  test('header ES256 with an Ed25519 key fails', () => {
+    const jws = compactJws({ alg: 'ES256' }, PAYLOAD, edSign);
+    assert.strictEqual(verifyJwsWithPublicKey(jws, edPubHex), false);
+  });
+
+  test('header EdDSA with a P-256 key fails', () => {
+    const jws = compactJws({ alg: 'EdDSA' }, PAYLOAD, es256Sign);
+    assert.strictEqual(verifyJwsWithPublicKey(jws, p256Uncompressed), false);
+  });
+
+  test('DER-encoded ES256 signature fails', () => {
+    const jws = compactJws({ alg: 'ES256' }, PAYLOAD, es256SignDer);
+    assert.strictEqual(verifyJwsWithPublicKey(jws, p256Uncompressed), false);
+  });
+
+  test('unknown alg fails', () => {
+    for (const alg of ['ES384', 'RS256', 'HS256', 'none']) {
+      const jws = compactJws({ alg }, PAYLOAD, es256Sign);
+      assert.strictEqual(verifyJwsWithPublicKey(jws, p256Uncompressed), false, alg);
+    }
+  });
+
+  test('missing alg fails, no fallback to Ed25519', () => {
+    const jws = compactJws({ typ: 'JWT' }, PAYLOAD, edSign);
+    assert.strictEqual(verifyJwsWithPublicKey(jws, edPubHex), false);
+  });
+
+  test('verifyCredentialWithKey still verifies an EdDSA VC end to end', async () => {
+    const identifier = 'd34ed796a4dc4698';
+    const calldata = `MolTrust/DID/v1/${identifier}/${edPubHex}`;
+    const client = {
+      getTransaction: async () => ({ input: `0x${Buffer.from(calldata).toString('hex')}` }),
+    };
+    const vc = makeVC();
+    vc.proof!.jws = compactJws({ alg: 'EdDSA' }, PAYLOAD, edSign);
+    const result = await verifyCredentialWithKey(vc, `0x${'ab'.repeat(32)}`, client);
+    assert.strictEqual(result.checks.signatureVerified, true);
+    assert.strictEqual(result.valid, true);
   });
 });
